@@ -1,0 +1,10 @@
+# 建立（已存在會保留）
+type nul > .gitignore
+
+# 追加常見忽略項目
+echo .venv/>> .gitignore
+echo venv/>> .gitignore
+echo __pycache__/>> .gitignore
+echo build/>> .gitignore
+echo dist/>> .gitignore
+echo *.spec>> .gitignore
