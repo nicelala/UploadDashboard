@@ -11,15 +11,16 @@ import logging
 from logging.handlers import RotatingFileHandler
 import time as time_mod
 from datetime import datetime, timedelta
+from datetime import datetime as _dt
 from typing import Optional, List, Tuple, Any, Dict
 import pandas as pd
-from PyQt6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QUrl
+from PyQt6.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QUrl, QSettings
 from PyQt6.QtGui import QAction
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox, QMessageBox,
-    QTableView, QSplitter, QFileDialog, QSpinBox, QFormLayout, QInputDialog
-)
+    QTableView, QSplitter, QFileDialog, QSpinBox, QFormLayout, QInputDialog,
+ QDialog,
+ QTextEdit)
 import subprocess
 import re
 import configparser
@@ -33,6 +34,19 @@ from PyQt6.QtGui import QDesktopServices  # NEW
 
 # 應用版本（發版時手動同步 /VERSION）
 __version__ = "2.0.0"  # NEW
+
+# --- 常數與 QSettings 範圍 ---  # NEW
+LOG_ROOT = "D:/"
+ORG_NAME = "UploadDashboard"
+APP_NAME = "UploadDashboard"
+
+# 設定鍵值
+SETK_AUTO_ENABLED   = "Cleanup/AutoEnabled"
+SETK_RETENTION_DAYS = "Cleanup/RetentionDays"
+SETK_SKIP_PREVIEW   = "Cleanup/SkipPreview"
+SETK_ROOT_PATH      = "Cleanup/RootPath"  # 預留（目前固定用 LOG_ROOT）
+DEFAULT_RETENTION   = 30
+
 
 DEFAULT_TIMEOUT_SEC: int = 300
 SUCCESS_RETURN_CODES = {0}
@@ -580,6 +594,233 @@ class BatFileDropLineEdit(QLineEdit):
         if isinstance(w, QMainWindow):
             w.statusBar().showMessage(msg, 5000)
 
+
+# ====================== LogCleaner ======================  # NEW
+class LogCleaner:
+    r"""
+    掃描 LOG_ROOT 下所有 <Project>\logs\ ，找出 <Project>_YYYYMMDD.csv ，
+    依保留天數（Retention）預覽/刪除。
+    """
+    FILE_PATTERN = re.compile(r"^(?P<proj>.+)_(?P<date>\d{8})\.csv$", re.IGNORECASE)
+
+    def __init__(self, root: str = LOG_ROOT):
+        self.root = os.path.normpath(root)
+
+    def _iter_project_log_files(self):
+        """yield (project, full_path, date_obj)；異常/不符命名者以 (None, path, None) 回報。"""
+        if not os.path.isdir(self.root):
+            return
+        # 專案目錄為 D:\<Project>\logs\
+        for entry in os.scandir(self.root):
+            if not entry.is_dir():
+                continue
+            proj = entry.name
+            log_dir = os.path.join(self.root, proj, "logs")
+            if not os.path.isdir(log_dir):
+                continue
+            for f in os.scandir(log_dir):
+                if not f.is_file():
+                    continue
+                name = f.name
+                m = self.FILE_PATTERN.match(name)
+                if not m:
+                    # 非規格檔名
+                    yield (None, f.path, None)
+                    continue
+                p2 = m.group("proj")
+                d8 = m.group("date")
+                # 檔名前綴應與專案資料夾名稱一致；否則忽略
+                if p2 != proj:
+                    yield (None, f.path, None)
+                    continue
+                try:
+                    dt = _dt.strptime(d8, "%Y%m%d").date()
+                except Exception:
+                    yield (None, f.path, None)
+                    continue
+                yield (proj, f.path, dt)
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        units = ["B","KB","MB","GB","TB"]
+        i = 0
+        x = float(n)
+        while x >= 1024 and i < len(units)-1:
+            x /= 1024.0
+            i += 1
+        return f"{x:.2f} {units[i]}"
+
+    def preview(self, retention_days: int):
+        """
+        回傳 dict：
+        {
+          "candidates": [ (proj, path, date_str, size) ... ],
+          "ignored":    [ path, ... ],
+          "total_size": int(bytes),
+          "count":      int
+        }
+        """
+        today = _dt.today().date()
+        from datetime import timedelta as _td
+        keep_after = today - _td(days=retention_days-1)
+        cands, ig, total = [], [], 0
+        for proj, path, dt in self._iter_project_log_files():
+            if proj is None or dt is None:
+                ig.append(path)
+                continue
+            # 小於 keep_after → 刪除；等於/大於 → 保留
+            if dt < keep_after:
+                try:
+                    size = os.path.getsize(path)
+                except Exception:
+                    size = 0
+                cands.append((proj, path, dt.strftime("%Y-%m-%d"), size))
+                total += size
+        return {
+            "candidates": cands,
+            "ignored": ig,
+            "total_size": total,
+            "count": len(cands),
+        }
+
+    def delete(self, file_list):
+        """實際刪除：file_list 來自 preview()['candidates'] 的 path 欄位"""
+        ok, fail, bytes_freed = 0, 0, 0
+        for item in file_list:
+            path = item[1] if isinstance(item, tuple) else item
+            try:
+                sz = os.path.getsize(path)
+            except Exception:
+                sz = 0
+            try:
+                os.remove(path)
+                ok += 1
+                bytes_freed += sz
+            except Exception:
+                fail += 1
+        return {"deleted": ok, "failed": fail, "bytes_freed": bytes_freed}
+# ==================== /LogCleaner =======================
+
+# ====================== LogCleanupDialog ======================  # NEW
+class LogCleanupDialog(QDialog):
+    def __init__(self, parent=None, settings: QSettings | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("日誌清理")
+        self.setModal(True)
+        self.settings = settings or QSettings(ORG_NAME, APP_NAME)
+        self.cleaner = LogCleaner(LOG_ROOT)
+
+        # 介面
+        v = QVBoxLayout(self)
+
+        # 根路徑與說明
+        v.addWidget(QLabel(f"根路徑：{LOG_ROOT}"))
+        v.addWidget(QLabel("說明：會掃描 D:\\<Project>\\logs\\ 內符合 <Project>_YYYYMMDD.csv 的日誌檔；"
+                           "不符合命名規則者將顯示為「忽略」。"))
+
+        # 手動清理區
+        hv1 = QHBoxLayout()
+        hv1.addWidget(QLabel("保留最近"))
+        self.sb_days = QSpinBox()
+        self.sb_days.setRange(1, 3650)
+        self.sb_days.setValue(self.settings.value(SETK_RETENTION_DAYS, DEFAULT_RETENTION, int))
+        hv1.addWidget(self.sb_days)
+        hv1.addWidget(QLabel("天"))
+        self.btn_preview = QPushButton("預覽")
+        self.btn_execute = QPushButton("執行清理")
+        self.btn_open = QPushButton("開啟日誌根目錄")
+        hv1.addWidget(self.btn_preview)
+        hv1.addWidget(self.btn_execute)
+        hv1.addWidget(self.btn_open)
+        hv1.addStretch()
+        v.addLayout(hv1)
+
+        # 自動清理區
+        self.chk_auto = QCheckBox("啟用自動清理（程式啟動時執行）")
+        self.chk_auto.setChecked(self.settings.value(SETK_AUTO_ENABLED, False, bool))
+        v.addWidget(self.chk_auto)
+
+        # 記住選擇
+        self.chk_skip_preview = QCheckBox("刪除前不再顯示預覽（記住我的選擇）")
+        self.chk_skip_preview.setChecked(self.settings.value(SETK_SKIP_PREVIEW, False, bool))
+        v.addWidget(self.chk_skip_preview)
+
+        # 結果輸出
+        self.txt = QTextEdit()
+        self.txt.setReadOnly(True)
+        self.txt.setMinimumHeight(240)
+        v.addWidget(self.txt)
+
+        # 底部
+        hb = QHBoxLayout()
+        self.btn_close = QPushButton("關閉")
+        hb.addStretch()
+        hb.addWidget(self.btn_close)
+        v.addLayout(hb)
+
+        # 事件
+        self.btn_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_ROOT)))
+        self.btn_preview.clicked.connect(self.on_preview)
+        self.btn_execute.clicked.connect(self.on_execute)
+        self.btn_close.clicked.connect(self.accept)
+        self.chk_auto.stateChanged.connect(self.on_settings_changed)
+        self.sb_days.valueChanged.connect(self.on_settings_changed)
+        self.chk_skip_preview.stateChanged.connect(self.on_settings_changed)
+
+        self._last_preview = None
+
+    def on_settings_changed(self, *args):
+        self.settings.setValue(SETK_AUTO_ENABLED, bool(self.chk_auto.isChecked()))
+        self.settings.setValue(SETK_RETENTION_DAYS, int(self.sb_days.value()))
+        self.settings.setValue(SETK_SKIP_PREVIEW, bool(self.chk_skip_preview.isChecked()))
+        self.settings.sync()
+
+    def on_preview(self):
+        rdays = int(self.sb_days.value())
+        rep = self.cleaner.preview(rdays)
+        self._last_preview = rep
+        size_str = self.cleaner._fmt_size(rep["total_size"])
+        lines = [f"將刪除檔案：{rep['count']} 個，總計 {size_str}"]
+        if rep["count"] > 0:
+            lines.append("— 列表 —")
+            for proj, path, d, sz in rep["candidates"]:
+                lines.append(f"[{proj}] {os.path.basename(path)}  ({d}, {self.cleaner._fmt_size(sz)})")
+        if rep["ignored"]:
+            lines.append("")
+            lines.append(f"忽略（檔名非規格或日期解析失敗）：{len(rep['ignored'])} 個")
+        self.txt.setPlainText("\n".join(lines))
+
+    def on_execute(self):
+        rdays = int(self.sb_days.value())
+        # 若未預覽或使用者勾了「不再顯示預覽」
+        need_preview = not bool(self.settings.value(SETK_SKIP_PREVIEW, False, bool))
+        if (self._last_preview is None or need_preview) and not self._confirm_preview_then_cache(rdays):
+            return
+        rep = self._last_preview or self.cleaner.preview(rdays)
+        paths = rep["candidates"]
+        if not paths:
+            QMessageBox.information(self, "日誌清理", "沒有可刪除的檔案。")
+            return
+        # 執行刪除
+        stat = self.cleaner.delete(paths)
+        freed = self.cleaner._fmt_size(stat["bytes_freed"])
+        self.txt.append("\n[執行結果]")
+        self.txt.append(f"刪除：{stat['deleted']}，失敗：{stat['failed']}，釋放空間：{freed}")
+        # 使預覽失效（避免重用舊清單）
+        self._last_preview = None
+
+    def _confirm_preview_then_cache(self, rdays: int) -> bool:
+        """在未關閉預覽的情況下，先跑一次預覽，讓使用者看過再刪。"""
+        self.on_preview()
+        rep = self._last_preview
+        size_str = self.cleaner._fmt_size(rep["total_size"])
+        msg = f"將刪除 {rep['count']} 個檔案，總計 {size_str}。\n\n是否繼續？"
+        r = QMessageBox.question(self, "日誌清理確認", msg,
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                 QMessageBox.StandardButton.No)
+        return r == QMessageBox.StandardButton.Yes
+# ==================== /LogCleanupDialog =======================
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -594,6 +835,9 @@ class MainWindow(QMainWindow):
         self.timer.start()
         self.refresh_all()
         self._unknown_warned_keys: set[str] = set()  # NEW：避免 E000 對話框洗版
+        self.settings = QSettings(ORG_NAME, APP_NAME)
+        QTimer.singleShot(1500, self._maybe_auto_cleanup)
+
 
     def _build_menu(self) -> None:
         menubar = self.menuBar()
@@ -612,6 +856,22 @@ class MainWindow(QMainWindow):
         rules_menu = menubar.addMenu("Rules")  # NEW
 
         act_open_rules = QAction("開啟關鍵字規則檔…", self)  # NEW
+        # Tools / 工具 選單
+        tools_menu = None
+        for a in menubar.actions():
+            if a.text().replace("&","") in ("工具","Tools"):
+                tools_menu = a.menu()
+                break
+        if tools_menu is None:
+            tools_menu = menubar.addMenu("工具")
+
+        act_cleanup = QAction("日誌清理…", self)
+        def _open_cleanup():
+            dlg = LogCleanupDialog(self, settings=self.settings)
+            dlg.exec()
+        act_cleanup.triggered.connect(_open_cleanup)
+        tools_menu.addAction(act_cleanup)
+
         def _open_rules():  # NEW
             path = os.path.abspath(ERROR_KEYWORDS_CSV)
             # 若檔案不存在先建立（含表頭）
@@ -877,6 +1137,23 @@ class MainWindow(QMainWindow):
         proj_layout.addWidget(left, 2)
         proj_layout.addWidget(right, 1)
         self.statusBar().showMessage("Ready")
+
+    def _maybe_auto_cleanup(self):
+        try:
+            if not self.settings.value(SETK_AUTO_ENABLED, False, bool):
+                return
+            rdays = self.settings.value(SETK_RETENTION_DAYS, DEFAULT_RETENTION, int)
+            cleaner = LogCleaner(LOG_ROOT)
+            rep = cleaner.preview(rdays)
+            if rep["count"] > 0:
+                stat = cleaner.delete(rep["candidates"])
+                freed = cleaner._fmt_size(stat["bytes_freed"])
+                self.statusBar().showMessage(
+                    f"自動清理完成：刪除 {stat['deleted']} 個，釋放 {freed}", 7000
+                )
+        except Exception:
+            # 靜默處理，避免影響啟動
+            pass
 
     def _browse_bat(self, target_edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "選取 .bat", "", "Batch Files (*.bat)")
