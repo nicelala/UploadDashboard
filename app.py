@@ -31,6 +31,7 @@ import shlex
 import csv  # NEW
 import re   # NEW
 from PyQt6.QtGui import QDesktopServices  # NEW
+from PyQt6.QtGui import QDesktopServices, QIcon  # UPDATED
 
 # 應用版本（發版時手動同步 /VERSION）
 __version__ = "2.0.0"  # NEW
@@ -596,21 +597,32 @@ class BatFileDropLineEdit(QLineEdit):
 
 
 # ====================== LogCleaner ======================  # NEW
+# ====================== LogCleaner ======================  # UPDATED
 class LogCleaner:
     r"""
-    掃描 LOG_ROOT 下所有 <Project>\logs\ ，找出 <Project>_YYYYMMDD.csv ，
-    依保留天數（Retention）預覽/刪除。
+    掃描 LOG_ROOT 下所有 <Project>\logs\ ，清理：
+    1) CSV：<Project>_YYYYMMDD.csv（僅此規格）
+    2) RUN-LOG：
+       - 全部 *.log
+       - 無副檔名的 ..._stdout / ..._stderr
+    日期優先取自檔名（_YYYYMMDD_），否則退回檔案 mtime。
     """
-    FILE_PATTERN = re.compile(r"^(?P<proj>.+)_(?P<date>\d{8})\.csv$", re.IGNORECASE)
+    FILE_PATTERN_CSV = re.compile(r"^(?P<proj>.+)_(?P<date>\d{8})\.csv$", re.IGNORECASE)
+    FILE_PATTERN_DATE = re.compile(r"_(?P<date>\d{8})(?:_|\.|$)")  # 用於 *.log / 無副檔名 stdout/stderr
+    FILE_PATTERN_STDSTREAM_BARE = re.compile(r"_(stdout|stderr)$", re.IGNORECASE)
 
-    def __init__(self, root: str = LOG_ROOT):
-        self.root = os.path.normpath(root)
+    def __init__(self, root: str | None = None):
+        # 避免類別定義期引用常數名稱順序問題
+        self.root = os.path.normpath(root or LOG_ROOT)
 
     def _iter_project_log_files(self):
-        """yield (project, full_path, date_obj)；異常/不符命名者以 (None, path, None) 回報。"""
+        """
+        yield (project, full_path, date_obj, kind)
+        kind in {"csv", "runlog"}；異常/不符命名者以 (None, path, None, None) 回報。
+        """
         if not os.path.isdir(self.root):
             return
-        # 專案目錄為 D:\<Project>\logs\
+
         for entry in os.scandir(self.root):
             if not entry.is_dir():
                 continue
@@ -618,34 +630,70 @@ class LogCleaner:
             log_dir = os.path.join(self.root, proj, "logs")
             if not os.path.isdir(log_dir):
                 continue
+
             for f in os.scandir(log_dir):
                 if not f.is_file():
                     continue
+                path = f.path
                 name = f.name
-                m = self.FILE_PATTERN.match(name)
-                if not m:
-                    # 非規格檔名
-                    yield (None, f.path, None)
+
+                # 1) CSV：只吃規格 <Project>_YYYYMMDD.csv
+                if name.lower().endswith(".csv"):
+                    m = self.FILE_PATTERN_CSV.match(name)
+                    if not m:
+                        yield (None, path, None, None)  # 非規格 CSV → 忽略
+                        continue
+                    p2 = m.group("proj")
+                    d8 = m.group("date")
+                    if p2 != proj:
+                        yield (None, path, None, None)  # 前綴不一致 → 忽略
+                        continue
+                    try:
+                        dt = _dt.strptime(d8, "%Y%m%d").date()
+                    except Exception:
+                        yield (None, path, None, None)
+                        continue
+                    yield (proj, path, dt, "csv")
                     continue
-                p2 = m.group("proj")
-                d8 = m.group("date")
-                # 檔名前綴應與專案資料夾名稱一致；否則忽略
-                if p2 != proj:
-                    yield (None, f.path, None)
+
+                low = name.lower()
+
+                # 2) RUN-LOG：全部 *.log
+                if low.endswith(".log"):
+                    # 檔名擷取日期；若無 → 用 mtime
+                    m = self.FILE_PATTERN_DATE.search(name)
+                    if m:
+                        try:
+                            dt = _dt.strptime(m.group("date"), "%Y%m%d").date()
+                        except Exception:
+                            dt = _dt.fromtimestamp(os.path.getmtime(path)).date()
+                    else:
+                        dt = _dt.fromtimestamp(os.path.getmtime(path)).date()
+                    yield (proj, path, dt, "runlog")
                     continue
-                try:
-                    dt = _dt.strptime(d8, "%Y%m%d").date()
-                except Exception:
-                    yield (None, f.path, None)
+
+                # 3) 無副檔名 stdout/stderr（…_stdout / …_stderr）
+                if self.FILE_PATTERN_STDSTREAM_BARE.search(low):
+                    m = self.FILE_PATTERN_DATE.search(name)
+                    if m:
+                        try:
+                            dt = _dt.strptime(m.group("date"), "%Y%m%d").date()
+                        except Exception:
+                            dt = _dt.fromtimestamp(os.path.getmtime(path)).date()
+                    else:
+                        dt = _dt.fromtimestamp(os.path.getmtime(path)).date()
+                    yield (proj, path, dt, "runlog")
                     continue
-                yield (proj, f.path, dt)
+
+                # 其他檔案 → 忽略
+                yield (None, path, None, None)
 
     @staticmethod
     def _fmt_size(n: int) -> str:
-        units = ["B","KB","MB","GB","TB"]
+        units = ["B", "KB", "MB", "GB", "TB"]
         i = 0
         x = float(n)
-        while x >= 1024 and i < len(units)-1:
+        while x >= 1024 and i < len(units) - 1:
             x /= 1024.0
             i += 1
         return f"{x:.2f} {units[i]}"
@@ -661,10 +709,10 @@ class LogCleaner:
         }
         """
         today = _dt.today().date()
-        from datetime import timedelta as _td
-        keep_after = today - _td(days=retention_days-1)
+        keep_after = today - timedelta(days=retention_days - 1)
         cands, ig, total = [], [], 0
-        for proj, path, dt in self._iter_project_log_files():
+
+        for proj, path, dt, kind in self._iter_project_log_files():
             if proj is None or dt is None:
                 ig.append(path)
                 continue
@@ -676,6 +724,7 @@ class LogCleaner:
                     size = 0
                 cands.append((proj, path, dt.strftime("%Y-%m-%d"), size))
                 total += size
+
         return {
             "candidates": cands,
             "ignored": ig,
@@ -1136,6 +1185,14 @@ class MainWindow(QMainWindow):
 
         proj_layout.addWidget(left, 2)
         proj_layout.addWidget(right, 1)
+        # 設定視窗圖示（相對路徑 assets/monitor_dashboard_icon_136391.ico）  # NEW
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            ico_path = os.path.join(base_dir, "assets", "monitor_dashboard_icon_136391.ico")
+            if os.path.isfile(ico_path):
+                self.setWindowIcon(QIcon(ico_path))
+        except Exception:
+            pass
         self.statusBar().showMessage("Ready")
 
     def _maybe_auto_cleanup(self):
